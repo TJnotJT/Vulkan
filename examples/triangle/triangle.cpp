@@ -18,6 +18,8 @@
 #include <fstream>
 #include <vector>
 #include <exception>
+#include <numbers>
+#include <array>
 
 #define GLM_FORCE_RADIANS
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
@@ -35,10 +37,19 @@ constexpr auto MAX_CONCURRENT_FRAMES = 2;
 class VulkanExample : public VulkanExampleBase
 {
 public:
+	VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT extInterlock {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT,
+		.pNext = nullptr,
+		.fragmentShaderSampleInterlock = VK_FALSE,
+		.fragmentShaderPixelInterlock = VK_TRUE,
+		.fragmentShaderShadingRateInterlock = VK_FALSE
+	};
+
 	// Vertex layout used in this example
 	struct Vertex {
 		float position[3];
-		float color[3];
+		float color[4];
+		float texture[2];
 	};
 
 	// Vertex buffer and attributes
@@ -84,6 +95,14 @@ public:
 		glm::mat4 viewMatrix;
 	};
 
+	// Texture to draw to.
+	vks::Texture fsiImageColor;
+	vks::Texture fsiImageDepth;
+
+	// Textures to sample from.
+	vks::Texture imageBase;
+	vks::Texture imageBlend;
+
 	// The pipeline layout is used by a pipeline to access the descriptor sets
 	// It defines interface (without binding any actual data) between the shader stages used by the pipeline and the shader resources
 	// A pipeline layout can be shared among multiple pipelines as long as their interfaces match
@@ -93,7 +112,8 @@ public:
 	// While in OpenGL every state can be changed at (almost) any time, Vulkan requires to layout the graphics (and compute) pipeline states upfront
 	// So for each combination of non-dynamic pipeline states you need a new pipeline (there are a few exceptions to this not discussed here)
 	// Even though this adds a new dimension of planning ahead, it's a great opportunity for performance optimizations by the driver
-	VkPipeline pipeline{ VK_NULL_HANDLE };
+	VkPipeline pipelineBase{ VK_NULL_HANDLE };
+	VkPipeline pipelineBlend{ VK_NULL_HANDLE };
 
 	// The descriptor set layout describes the shader binding layout (without actually referencing descriptor)
 	// Like the pipeline layout it's pretty much a blueprint and can be used with different descriptor sets as long as their layout matches
@@ -131,7 +151,12 @@ public:
 		// Clean up used Vulkan resources
 		// Note: Inherited destructor cleans up resources stored in base class
 		if (device) {
-			vkDestroyPipeline(device, pipeline, nullptr);
+			fsiImageColor.destroy();
+			fsiImageDepth.destroy();
+			imageBase.destroy();
+			imageBlend.destroy();
+			vkDestroyPipeline(device, pipelineBase, nullptr);
+			vkDestroyPipeline(device, pipelineBlend, nullptr);
 			vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
 			vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 			vkDestroyBuffer(device, vertices.buffer, nullptr);
@@ -226,16 +251,31 @@ public:
 		//	This is a very complex topic and while it's fine for an example application to small individual memory allocations that is not
 		//	what should be done a real-world application, where you should allocate large chunks of memory at once instead.
 
-		// Setup vertices
-		std::vector<Vertex> vertexBuffer{
-			{ {  1.0f,  1.0f, 0.0f }, { 1.0f, 0.0f, 0.0f } },
-			{ { -1.0f,  1.0f, 0.0f }, { 0.0f, 1.0f, 0.0f } },
-			{ {  0.0f, -1.0f, 0.0f }, { 0.0f, 0.0f, 1.0f } }
-		};
+		// Setup vertices and indices
+		std::vector<Vertex> vertexBuffer;
+		std::vector<uint32_t> indexBuffer;
+
+		// Translate and replicate the cube in a 3D grid
+		for (int i = 0; i < 11; i++)
+		{
+			for (int j = 0; j < 11; j++)
+			{
+				for (int k = 0; k < 11; k++)
+				{
+					transformVertices(1.25f * (float)(j - 5), 1.25f * (float)(k - 5), -1.25f * (float)(11 - i), 0.0f, 0.0f);
+
+					for (uint32_t index : cubeIndices)
+					{
+						indexBuffer.push_back(index + static_cast<uint32_t>(vertexBuffer.size()));
+					}
+
+					vertexBuffer.insert(vertexBuffer.end(), cubeVerticesTransformed.begin(), cubeVerticesTransformed.end());
+				}
+			}
+		}
+
 		uint32_t vertexBufferSize = static_cast<uint32_t>(vertexBuffer.size()) * sizeof(Vertex);
 
-		// Setup indices
-		std::vector<uint32_t> indexBuffer{ 0, 1, 2 };
 		indices.count = static_cast<uint32_t>(indexBuffer.size());
 		uint32_t indexBufferSize = indices.count * sizeof(uint32_t);
 
@@ -342,7 +382,7 @@ public:
 		vkCmdCopyBuffer(copyCmd, stagingBuffers.vertices.buffer, vertices.buffer, 1, &copyRegion);
 		// Index buffer
 		copyRegion.size = indexBufferSize;
-		vkCmdCopyBuffer(copyCmd, stagingBuffers.indices.buffer, indices.buffer,	1, &copyRegion);
+		vkCmdCopyBuffer(copyCmd, stagingBuffers.indices.buffer, indices.buffer, 1, &copyRegion);
 		VK_CHECK_RESULT(vkEndCommandBuffer(copyCmd));
 
 		// Submit the command buffer to the queue to finish the copy
@@ -378,7 +418,7 @@ public:
 	void createDescriptorPool()
 	{
 		// We need to tell the API the number of max. requested descriptors per type
-		VkDescriptorPoolSize descriptorTypeCounts[1]{};
+		std::array<VkDescriptorPoolSize, 3> descriptorTypeCounts{};
 		// This example only one descriptor type (uniform buffer)
 		descriptorTypeCounts[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 		// We have one buffer (and as such descriptor) per frame
@@ -388,13 +428,21 @@ public:
 		// typeCounts[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 		// typeCounts[1].descriptorCount = 2;
 
+		// Descriptors for FSI drawing.
+		descriptorTypeCounts[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+		descriptorTypeCounts[1].descriptorCount = 2 * MAX_CONCURRENT_FRAMES;
+
+		// Source textures
+		descriptorTypeCounts[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		descriptorTypeCounts[2].descriptorCount = 2 * MAX_CONCURRENT_FRAMES;
+
 		// Create the global descriptor pool
 		// All descriptors used in this example are allocated from this pool
 		VkDescriptorPoolCreateInfo descriptorPoolCI{};
 		descriptorPoolCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 		descriptorPoolCI.pNext = nullptr;
-		descriptorPoolCI.poolSizeCount = 1;
-		descriptorPoolCI.pPoolSizes = descriptorTypeCounts;
+		descriptorPoolCI.poolSizeCount = static_cast<uint32_t>(descriptorTypeCounts.size());
+		descriptorPoolCI.pPoolSizes = descriptorTypeCounts.data();
 		// Set the max. number of descriptor sets that can be requested from this pool (requesting beyond this limit will result in an error)
 		// Our sample will create one set per uniform buffer per frame
 		descriptorPoolCI.maxSets = MAX_CONCURRENT_FRAMES;
@@ -406,18 +454,48 @@ public:
 	// So every shader binding should map to one descriptor set layout binding
 	void createDescriptorSetLayout()
 	{
+		std::array<VkDescriptorSetLayoutBinding, 5> layoutBindings{};
+
 		// Binding 0: Uniform buffer (Vertex shader)
-		VkDescriptorSetLayoutBinding layoutBinding{};
-		layoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-		layoutBinding.descriptorCount = 1;
-		layoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-		layoutBinding.pImmutableSamplers = nullptr;
+		layoutBindings[0].binding = 0;
+		layoutBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+		layoutBindings[0].descriptorCount = 1;
+		layoutBindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+		layoutBindings[0].pImmutableSamplers = nullptr;
+
+		// Binding 1: Storage image (fragment shader)
+		layoutBindings[1].binding = 1;
+		layoutBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+		layoutBindings[1].descriptorCount = 1;
+		layoutBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+		layoutBindings[1].pImmutableSamplers = nullptr;
+
+		// Binding 2: Storage image (fragment shader)
+		layoutBindings[2].binding = 2;
+		layoutBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+		layoutBindings[2].descriptorCount = 1;
+		layoutBindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+		layoutBindings[2].pImmutableSamplers = nullptr;
+
+		// Binding 3: Sampled image (fragment shader)
+		layoutBindings[3].binding = 3;
+		layoutBindings[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		layoutBindings[3].descriptorCount = 1;
+		layoutBindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+		layoutBindings[3].pImmutableSamplers = nullptr;
+
+		// Binding 4: Sampled image (fragment shader)
+		layoutBindings[4].binding = 4;
+		layoutBindings[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		layoutBindings[4].descriptorCount = 1;
+		layoutBindings[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+		layoutBindings[4].pImmutableSamplers = nullptr;
 
 		VkDescriptorSetLayoutCreateInfo descriptorLayoutCI{};
 		descriptorLayoutCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
 		descriptorLayoutCI.pNext = nullptr;
-		descriptorLayoutCI.bindingCount = 1;
-		descriptorLayoutCI.pBindings = &layoutBinding;
+		descriptorLayoutCI.bindingCount = static_cast<uint32_t>(layoutBindings.size());
+		descriptorLayoutCI.pBindings = layoutBindings.data();
 		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorLayoutCI, nullptr, &descriptorSetLayout));
 	}
 
@@ -437,7 +515,7 @@ public:
 			// Update the descriptor set determining the shader binding points
 			// For every binding point used in a shader there needs to be one
 			// descriptor set matching that binding point
-			VkWriteDescriptorSet writeDescriptorSet{};
+			std::array<VkWriteDescriptorSet, 5> writeDescriptorSet{};
 			
 			// The buffer's information is passed using a descriptor info structure
 			VkDescriptorBufferInfo bufferInfo{};
@@ -445,13 +523,46 @@ public:
 			bufferInfo.range = sizeof(ShaderData);
 
 			// Binding 0 : Uniform buffer
-			writeDescriptorSet.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-			writeDescriptorSet.dstSet = uniformBuffers[i].descriptorSet;
-			writeDescriptorSet.descriptorCount = 1;
-			writeDescriptorSet.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-			writeDescriptorSet.pBufferInfo = &bufferInfo;
-			writeDescriptorSet.dstBinding = 0;
-			vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
+			writeDescriptorSet[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writeDescriptorSet[0].dstSet = uniformBuffers[i].descriptorSet;
+			writeDescriptorSet[0].descriptorCount = 1;
+			writeDescriptorSet[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+			writeDescriptorSet[0].pBufferInfo = &bufferInfo;
+			writeDescriptorSet[0].dstBinding = 0;
+
+			// Binding 1 : Storage image
+			writeDescriptorSet[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writeDescriptorSet[1].dstSet = uniformBuffers[i].descriptorSet;
+			writeDescriptorSet[1].descriptorCount = 1;
+			writeDescriptorSet[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+			writeDescriptorSet[1].pImageInfo = &fsiImageColor.descriptor;
+			writeDescriptorSet[1].dstBinding = 1;
+
+			// Binding 2 : Storage image
+			writeDescriptorSet[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writeDescriptorSet[2].dstSet = uniformBuffers[i].descriptorSet;
+			writeDescriptorSet[2].descriptorCount = 1;
+			writeDescriptorSet[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+			writeDescriptorSet[2].pImageInfo = &fsiImageDepth.descriptor;
+			writeDescriptorSet[2].dstBinding = 2;
+
+			// Binding 3 : Sampled image
+			writeDescriptorSet[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writeDescriptorSet[3].dstSet = uniformBuffers[i].descriptorSet;
+			writeDescriptorSet[3].descriptorCount = 1;
+			writeDescriptorSet[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			writeDescriptorSet[3].pImageInfo = &imageBase.descriptor;
+			writeDescriptorSet[3].dstBinding = 3;
+
+			// Binding 4 : Sampled image
+			writeDescriptorSet[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writeDescriptorSet[4].dstSet = uniformBuffers[i].descriptorSet;
+			writeDescriptorSet[4].descriptorCount = 1;
+			writeDescriptorSet[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			writeDescriptorSet[4].pImageInfo = &imageBlend.descriptor;
+			writeDescriptorSet[4].dstBinding = 4;
+
+			vkUpdateDescriptorSets(device, static_cast<uint32_t>(writeDescriptorSet.size()), writeDescriptorSet.data(), 0, nullptr);
 		}
 	}
 
@@ -624,6 +735,430 @@ public:
 		VK_CHECK_RESULT(vkCreateRenderPass(device, &renderPassCI, nullptr, &renderPass));
 	}
 
+	// Setup the FSI images
+	void createFSIImages()
+	{
+		// Color image
+		{
+			fsiImageColor.device = vulkanDevice;
+
+			VkImageCreateInfo imageInfo = vks::initializers::imageCreateInfo();
+			imageInfo.imageType = VK_IMAGE_TYPE_2D;
+			imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+			imageInfo.extent.width = width;
+			imageInfo.extent.height = height;
+			imageInfo.extent.depth = 1;
+			imageInfo.mipLevels = 1;
+			imageInfo.arrayLayers = 1;
+			imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+			imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+#if (defined(VK_USE_PLATFORM_IOS_MVK) || defined(VK_USE_PLATFORM_MACOS_MVK) || defined(VK_USE_PLATFORM_METAL_EXT))
+			// SRS - On macOS/iOS use linear tiling for atomic image access, see https://github.com/KhronosGroup/MoltenVK/issues/1027
+			imageInfo.tiling = VK_IMAGE_TILING_LINEAR;
+#else
+			imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+#endif
+			imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+
+			VK_CHECK_RESULT(vkCreateImage(device, &imageInfo, nullptr, &fsiImageColor.image));
+
+			fsiImageColor.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+			VkMemoryRequirements memReqs;
+			vkGetImageMemoryRequirements(device, fsiImageColor.image, &memReqs);
+
+			VkMemoryAllocateInfo memAlloc = vks::initializers::memoryAllocateInfo();
+			memAlloc.allocationSize = memReqs.size;
+			memAlloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+			VK_CHECK_RESULT(vkAllocateMemory(device, &memAlloc, nullptr, &fsiImageColor.deviceMemory));
+			VK_CHECK_RESULT(vkBindImageMemory(device, fsiImageColor.image, fsiImageColor.deviceMemory, 0));
+
+			VkImageViewCreateInfo imageViewInfo = vks::initializers::imageViewCreateInfo();
+			imageViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+			imageViewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+			imageViewInfo.flags = 0;
+			imageViewInfo.image = fsiImageColor.image;
+			imageViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			imageViewInfo.subresourceRange.baseMipLevel = 0;
+			imageViewInfo.subresourceRange.levelCount = 1;
+			imageViewInfo.subresourceRange.baseArrayLayer = 0;
+			imageViewInfo.subresourceRange.layerCount = 1;
+
+			VK_CHECK_RESULT(vkCreateImageView(device, &imageViewInfo, nullptr, &fsiImageColor.view));
+
+			fsiImageColor.width = width;
+			fsiImageColor.height = height;
+			fsiImageColor.mipLevels = 1;
+			fsiImageColor.layerCount = 1;
+			fsiImageColor.descriptor.imageView = fsiImageColor.view;
+			fsiImageColor.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+			fsiImageColor.sampler = VK_NULL_HANDLE;
+		}
+
+		// Depth image
+		{
+			fsiImageDepth.device = vulkanDevice;
+
+			VkImageCreateInfo imageInfo = vks::initializers::imageCreateInfo();
+			imageInfo.imageType = VK_IMAGE_TYPE_2D;
+			imageInfo.format = VK_FORMAT_R32_SFLOAT;
+			imageInfo.extent.width = width;
+			imageInfo.extent.height = height;
+			imageInfo.extent.depth = 1;
+			imageInfo.mipLevels = 1;
+			imageInfo.arrayLayers = 1;
+			imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+			imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+#if (defined(VK_USE_PLATFORM_IOS_MVK) || defined(VK_USE_PLATFORM_MACOS_MVK) || defined(VK_USE_PLATFORM_METAL_EXT))
+			// SRS - On macOS/iOS use linear tiling for atomic image access, see https://github.com/KhronosGroup/MoltenVK/issues/1027
+			imageInfo.tiling = VK_IMAGE_TILING_LINEAR;
+#else
+			imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+#endif
+			imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+
+			VK_CHECK_RESULT(vkCreateImage(device, &imageInfo, nullptr, &fsiImageDepth.image));
+
+			fsiImageDepth.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+			VkMemoryRequirements memReqs;
+			vkGetImageMemoryRequirements(device, fsiImageDepth.image, &memReqs);
+
+			VkMemoryAllocateInfo memAlloc = vks::initializers::memoryAllocateInfo();
+			memAlloc.allocationSize = memReqs.size;
+			memAlloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+			VK_CHECK_RESULT(vkAllocateMemory(device, &memAlloc, nullptr, &fsiImageDepth.deviceMemory));
+			VK_CHECK_RESULT(vkBindImageMemory(device, fsiImageDepth.image, fsiImageDepth.deviceMemory, 0));
+
+			VkImageViewCreateInfo imageViewInfo = vks::initializers::imageViewCreateInfo();
+			imageViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+			imageViewInfo.format = VK_FORMAT_R32_SFLOAT;
+			imageViewInfo.flags = 0;
+			imageViewInfo.image = fsiImageDepth.image;
+			imageViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			imageViewInfo.subresourceRange.baseMipLevel = 0;
+			imageViewInfo.subresourceRange.levelCount = 1;
+			imageViewInfo.subresourceRange.baseArrayLayer = 0;
+			imageViewInfo.subresourceRange.layerCount = 1;
+
+			VK_CHECK_RESULT(vkCreateImageView(device, &imageViewInfo, nullptr, &fsiImageDepth.view));
+
+			fsiImageDepth.width = width;
+			fsiImageDepth.height = height;
+			fsiImageDepth.mipLevels = 1;
+			fsiImageDepth.layerCount = 1;
+			fsiImageDepth.descriptor.imageView = fsiImageDepth.view;
+			fsiImageDepth.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+			fsiImageDepth.sampler = VK_NULL_HANDLE;
+		}
+
+		// Transition the images from UNDEFINED to GENERAL
+		{
+			VkCommandBufferAllocateInfo allocInfo{};
+			allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+			allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+			allocInfo.commandPool = commandPool;
+			allocInfo.commandBufferCount = 1;
+
+			VkCommandBuffer commandBuffer;
+			vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
+
+			VkCommandBufferBeginInfo beginInfo{};
+			beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+			beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+			vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+			VkImageMemoryBarrier barrier;
+			barrier = vks::initializers::imageMemoryBarrier();
+			barrier.srcAccessMask = VK_ACCESS_NONE;
+			barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			barrier.subresourceRange.levelCount = 1;
+			barrier.subresourceRange.layerCount = 1;
+			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+
+			barrier.image = fsiImageColor.image;
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			barrier.subresourceRange.baseMipLevel = 0;
+			barrier.subresourceRange.levelCount = 1;
+			barrier.subresourceRange.baseArrayLayer = 0;
+			barrier.subresourceRange.layerCount = 1;
+
+			vkCmdPipelineBarrier(
+				commandBuffer,
+				VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+				VK_PIPELINE_STAGE_TRANSFER_BIT,
+				0,
+				0, nullptr,
+				0, nullptr,
+				1, &barrier);
+
+			fsiImageColor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+			barrier.image = fsiImageDepth.image;
+
+			vkCmdPipelineBarrier(
+				commandBuffer,
+				VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+				VK_PIPELINE_STAGE_TRANSFER_BIT,
+				0,
+				0, nullptr,
+				0, nullptr,
+				1, &barrier);
+
+			fsiImageDepth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+			vkEndCommandBuffer(commandBuffer);
+
+			// Submit the command buffer to the queue to finish the copy
+			VkSubmitInfo submitInfo{};
+			submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+			submitInfo.commandBufferCount = 1;
+			submitInfo.pCommandBuffers = &commandBuffer;
+
+			// Create fence to ensure that the command buffer has finished executing
+			VkFenceCreateInfo fenceCI{};
+			fenceCI.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+			fenceCI.flags = 0;
+			VkFence fence;
+			VK_CHECK_RESULT(vkCreateFence(device, &fenceCI, nullptr, &fence));
+
+			// Submit to the queue
+			VK_CHECK_RESULT(vkQueueSubmit(queue, 1, &submitInfo, fence));
+			// Wait for the fence to signal that command buffer has finished executing
+			VK_CHECK_RESULT(vkWaitForFences(device, 1, &fence, VK_TRUE, DEFAULT_FENCE_TIMEOUT));
+
+			vkDestroyFence(device, fence, nullptr);
+			vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+		}
+	}
+
+	void createSourceTextures()
+	{
+		struct StagingBuffer {
+			VkDeviceMemory memory;
+			VkBuffer buffer;
+		} stagingBuffer;
+
+		void* data;
+
+		for (int i = 0; i < numTextures; i++)
+		{
+			vks::Texture& image = i == 0 ? imageBase : imageBlend;
+
+			image.device = vulkanDevice;
+
+			VkImageCreateInfo imageInfo = vks::initializers::imageCreateInfo();
+			imageInfo.imageType = VK_IMAGE_TYPE_2D;
+			imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+			imageInfo.extent.width = texWidth;
+			imageInfo.extent.height = texHeight;
+			imageInfo.extent.depth = 1;
+			imageInfo.mipLevels = 1;
+			imageInfo.arrayLayers = 1;
+			imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+			imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+#if (defined(VK_USE_PLATFORM_IOS_MVK) || defined(VK_USE_PLATFORM_MACOS_MVK) || defined(VK_USE_PLATFORM_METAL_EXT))
+			// SRS - On macOS/iOS use linear tiling for atomic image access, see https://github.com/KhronosGroup/MoltenVK/issues/1027
+			imageInfo.tiling = VK_IMAGE_TILING_LINEAR;
+#else
+			imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+#endif
+			imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+			VK_CHECK_RESULT(vkCreateImage(device, &imageInfo, nullptr, &image.image));
+
+			image.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+			VkMemoryRequirements memReqs;
+			vkGetImageMemoryRequirements(device, image.image, &memReqs);
+
+			VkMemoryAllocateInfo memAlloc = vks::initializers::memoryAllocateInfo();
+			memAlloc.allocationSize = memReqs.size;
+			memAlloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+			VK_CHECK_RESULT(vkAllocateMemory(device, &memAlloc, nullptr, &image.deviceMemory));
+			VK_CHECK_RESULT(vkBindImageMemory(device, image.image, image.deviceMemory, 0));
+
+			VkImageViewCreateInfo imageViewInfo = vks::initializers::imageViewCreateInfo();
+			imageViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+			imageViewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+			imageViewInfo.flags = 0;
+			imageViewInfo.image = image.image;
+			imageViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			imageViewInfo.subresourceRange.baseMipLevel = 0;
+			imageViewInfo.subresourceRange.levelCount = 1;
+			imageViewInfo.subresourceRange.baseArrayLayer = 0;
+			imageViewInfo.subresourceRange.layerCount = 1;
+
+			VK_CHECK_RESULT(vkCreateImageView(device, &imageViewInfo, nullptr, &image.view));
+
+			VkSamplerCreateInfo samplerInfo{};
+			samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+
+			// Bilinear filtering
+			samplerInfo.magFilter = VK_FILTER_LINEAR;   // magnification
+			samplerInfo.minFilter = VK_FILTER_LINEAR;   // minification
+
+			// No mipmapping (pure bilinear)
+			samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+			samplerInfo.minLod = 0.0f;
+			samplerInfo.maxLod = 0.0f;
+
+			// Addressing mode
+			samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+			samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+			samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+
+			// Optional settings
+			samplerInfo.anisotropyEnable = VK_FALSE;
+			samplerInfo.compareEnable = VK_FALSE;
+			samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+			samplerInfo.unnormalizedCoordinates = VK_FALSE;
+
+			VkSampler sampler;
+			VK_CHECK_RESULT(vkCreateSampler(device, &samplerInfo, nullptr, &sampler));
+
+			image.width = texWidth;
+			image.height = texHeight;
+			image.mipLevels = 1;
+			image.layerCount = 1;
+			image.descriptor.imageView = image.view;
+			image.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+			image.descriptor.sampler = sampler;
+			image.sampler = sampler;
+
+			const uint32_t texBufferSize = texWidth * texHeight * 4;
+
+			// Create staging buffer
+			VkBufferCreateInfo stagingBufferCI{};
+			stagingBufferCI.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+			stagingBufferCI.size = texBufferSize;
+			// Buffer is used as the copy source
+			stagingBufferCI.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+			// Create a host-visible buffer to copy the vertex data to (staging buffer)
+			VK_CHECK_RESULT(vkCreateBuffer(device, &stagingBufferCI, nullptr, &stagingBuffer.buffer));
+			vkGetBufferMemoryRequirements(device, stagingBuffer.buffer, &memReqs);
+			memAlloc.allocationSize = memReqs.size;
+			// Request a host visible memory type that can be used to copy our data to
+			// Also request it to be coherent, so that writes are visible to the GPU right after unmapping the buffer
+			memAlloc.memoryTypeIndex = getMemoryTypeIndex(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+			VK_CHECK_RESULT(vkAllocateMemory(device, &memAlloc, nullptr, &stagingBuffer.memory));
+			// Map and copy
+			VK_CHECK_RESULT(vkMapMemory(device, stagingBuffer.memory, 0, memAlloc.allocationSize, 0, &data));
+			memcpy(data, textureData[i], texBufferSize);
+			vkUnmapMemory(device, stagingBuffer.memory);
+			VK_CHECK_RESULT(vkBindBufferMemory(device, stagingBuffer.buffer, stagingBuffer.memory, 0));
+
+			// Buffer copies have to be submitted to a queue, so we need a command buffer for them
+			// Note: Some devices offer a dedicated transfer queue (with only the transfer bit set) that may be faster when doing lots of copies
+			VkCommandBuffer copyCmd;
+
+			VkCommandBufferAllocateInfo cmdBufAllocateInfo{};
+			cmdBufAllocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+			cmdBufAllocateInfo.commandPool = commandPool;
+			cmdBufAllocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+			cmdBufAllocateInfo.commandBufferCount = 1;
+			VK_CHECK_RESULT(vkAllocateCommandBuffers(device, &cmdBufAllocateInfo, &copyCmd));
+
+			VkCommandBufferBeginInfo cmdBufInfo = vks::initializers::commandBufferBeginInfo();
+			VK_CHECK_RESULT(vkBeginCommandBuffer(copyCmd, &cmdBufInfo));
+
+			// Transition texture to GENERAL
+			VkImageMemoryBarrier barrier;
+			barrier = vks::initializers::imageMemoryBarrier();
+			barrier.srcAccessMask = VK_ACCESS_NONE;
+			barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			barrier.subresourceRange.levelCount = 1;
+			barrier.subresourceRange.layerCount = 1;
+			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+
+			barrier.image = image.image;
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			barrier.subresourceRange.baseMipLevel = 0;
+			barrier.subresourceRange.levelCount = 1;
+			barrier.subresourceRange.baseArrayLayer = 0;
+			barrier.subresourceRange.layerCount = 1;
+
+			vkCmdPipelineBarrier(
+				copyCmd,
+				VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+				VK_PIPELINE_STAGE_TRANSFER_BIT,
+				0,
+				0, nullptr,
+				0, nullptr,
+				1, &barrier);
+
+			image.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+			// Put buffer region copies into command buffer
+			VkBufferImageCopy copyRegion{};
+			copyRegion.bufferOffset = 0;
+			copyRegion.bufferRowLength = 0;
+			copyRegion.bufferImageHeight = 0;
+			copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			copyRegion.imageSubresource.mipLevel = 0;
+			copyRegion.imageSubresource.baseArrayLayer = 0;
+			copyRegion.imageSubresource.layerCount = 1;
+			copyRegion.imageOffset = { 0, 0, 0 };
+			copyRegion.imageExtent = { texWidth, texHeight, 1 };
+			vkCmdCopyBufferToImage(copyCmd, stagingBuffer.buffer, image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copyRegion);
+
+			// Make sure the transfer completes
+			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+			vkCmdPipelineBarrier(
+				copyCmd,
+				VK_PIPELINE_STAGE_TRANSFER_BIT,
+				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				0,
+				0, nullptr,
+				0, nullptr,
+				1, &barrier);
+
+			VK_CHECK_RESULT(vkEndCommandBuffer(copyCmd));
+
+			// Submit the command buffer to the queue to finish the copy
+			VkSubmitInfo submitInfo{};
+			submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+			submitInfo.commandBufferCount = 1;
+			submitInfo.pCommandBuffers = &copyCmd;
+
+			// Create fence to ensure that the command buffer has finished executing
+			VkFenceCreateInfo fenceCI{};
+			fenceCI.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+			fenceCI.flags = 0;
+			VkFence fence;
+			VK_CHECK_RESULT(vkCreateFence(device, &fenceCI, nullptr, &fence));
+
+			// Submit to the queue
+			VK_CHECK_RESULT(vkQueueSubmit(queue, 1, &submitInfo, fence));
+			// Wait for the fence to signal that command buffer has finished executing
+			VK_CHECK_RESULT(vkWaitForFences(device, 1, &fence, VK_TRUE, DEFAULT_FENCE_TIMEOUT));
+
+			vkDestroyFence(device, fence, nullptr);
+			vkFreeCommandBuffers(device, commandPool, 1, &copyCmd);
+
+			// Destroy staging buffers
+			// Note: Staging buffer must not be deleted before the copies have been submitted and executed
+			vkDestroyBuffer(device, stagingBuffer.buffer, nullptr);
+			vkFreeMemory(device, stagingBuffer.memory, nullptr);
+		}
+	}
+
 	// Vulkan loads its shaders from an immediate binary representation called SPIR-V
 	// Shaders are compiled offline from e.g. GLSL using the reference glslang compiler
 	// This function loads such a shader from a binary file and returns a shader module structure
@@ -753,9 +1288,9 @@ public:
 		// We only use depth tests and want depth tests and writes to be enabled and compare with less or equal
 		VkPipelineDepthStencilStateCreateInfo depthStencilStateCI{};
 		depthStencilStateCI.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-		depthStencilStateCI.depthTestEnable = VK_TRUE;
-		depthStencilStateCI.depthWriteEnable = VK_TRUE;
-		depthStencilStateCI.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+		depthStencilStateCI.depthTestEnable = VK_FALSE;
+		depthStencilStateCI.depthWriteEnable = VK_FALSE;
+		depthStencilStateCI.depthCompareOp = VK_COMPARE_OP_ALWAYS;
 		depthStencilStateCI.depthBoundsTestEnable = VK_FALSE;
 		depthStencilStateCI.back.failOp = VK_STENCIL_OP_KEEP;
 		depthStencilStateCI.back.passOp = VK_STENCIL_OP_KEEP;
@@ -781,30 +1316,37 @@ public:
 		vertexInputBinding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
 		// Input attribute bindings describe shader attribute locations and memory layouts
-		std::array<VkVertexInputAttributeDescription, 2> vertexInputAttributs{};
+		std::array<VkVertexInputAttributeDescription, 3> vertexInputAttributes{};
 		// These match the following shader layout (see triangle.vert):
 		//	layout (location = 0) in vec3 inPos;
 		//	layout (location = 1) in vec3 inColor;
+		//	layout (location = 2) in vec2 inTex;
 		// Attribute location 0: Position
-		vertexInputAttributs[0].binding = 0;
-		vertexInputAttributs[0].location = 0;
+		vertexInputAttributes[0].binding = 0;
+		vertexInputAttributes[0].location = 0;
 		// Position attribute is three 32 bit signed (SFLOAT) floats (R32 G32 B32)
-		vertexInputAttributs[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-		vertexInputAttributs[0].offset = offsetof(Vertex, position);
+		vertexInputAttributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+		vertexInputAttributes[0].offset = offsetof(Vertex, position);
 		// Attribute location 1: Color
-		vertexInputAttributs[1].binding = 0;
-		vertexInputAttributs[1].location = 1;
-		// Color attribute is three 32 bit signed (SFLOAT) floats (R32 G32 B32)
-		vertexInputAttributs[1].format = VK_FORMAT_R32G32B32_SFLOAT;
-		vertexInputAttributs[1].offset = offsetof(Vertex, color);
+		vertexInputAttributes[1].binding = 0;
+		vertexInputAttributes[1].location = 1;
+		// Color attribute is four 32 bit signed (SFLOAT) floats (R32 G32 B32 A32)
+		vertexInputAttributes[1].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+		vertexInputAttributes[1].offset = offsetof(Vertex, color);
+		// Attribute location 2: Texture
+		vertexInputAttributes[2].binding = 0;
+		vertexInputAttributes[2].location = 2;
+		// Texture attribute is two 32 bit signed (SFLOAT) floats (S32 T32)
+		vertexInputAttributes[2].format = VK_FORMAT_R32G32_SFLOAT;
+		vertexInputAttributes[2].offset = offsetof(Vertex, texture);
 
 		// Vertex input state used for pipeline creation
 		VkPipelineVertexInputStateCreateInfo vertexInputStateCI{};
 		vertexInputStateCI.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
 		vertexInputStateCI.vertexBindingDescriptionCount = 1;
 		vertexInputStateCI.pVertexBindingDescriptions = &vertexInputBinding;
-		vertexInputStateCI.vertexAttributeDescriptionCount = 2;
-		vertexInputStateCI.pVertexAttributeDescriptions = vertexInputAttributs.data();
+		vertexInputStateCI.vertexAttributeDescriptionCount = static_cast<uint32_t>(vertexInputAttributes.size());
+		vertexInputStateCI.pVertexAttributeDescriptions = vertexInputAttributes.data();
 
 		// Shaders
 		std::array<VkPipelineShaderStageCreateInfo, 2> shaderStages{};
@@ -814,17 +1356,17 @@ public:
 		// Set pipeline stage for this shader
 		shaderStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
 		// Load binary SPIR-V shader
-		shaderStages[0].module = loadSPIRVShader(getShadersPath() + "triangle/triangle.vert.spv");
+		shaderStages[0].module = loadSPIRVShader(getShadersPath() + "triangle/triangleFSI.vert.spv");
 		// Main entry point for the shader
 		shaderStages[0].pName = "main";
 		assert(shaderStages[0].module != VK_NULL_HANDLE);
 
-		// Fragment shader
+		// Fragment shader (base)
 		shaderStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 		// Set pipeline stage for this shader
 		shaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
 		// Load binary SPIR-V shader
-		shaderStages[1].module = loadSPIRVShader(getShadersPath() + "triangle/triangle.frag.spv");
+		shaderStages[1].module = loadSPIRVShader(getShadersPath() + "triangle/triangleFSIBase.frag.spv");
 		// Main entry point for the shader
 		shaderStages[1].pName = "main";
 		assert(shaderStages[1].module != VK_NULL_HANDLE);
@@ -844,7 +1386,22 @@ public:
 		pipelineCI.pDynamicState = &dynamicStateCI;
 
 		// Create rendering pipeline using the specified states
-		VK_CHECK_RESULT(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineCI, nullptr, &pipeline));
+		VK_CHECK_RESULT(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineCI, nullptr, &pipelineBase));
+
+		vkDestroyShaderModule(device, shaderStages[1].module, nullptr);
+
+		// Fragment shader (blend)
+		shaderStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		// Set pipeline stage for this shader
+		shaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+		// Load binary SPIR-V shader
+		shaderStages[1].module = loadSPIRVShader(getShadersPath() + "triangle/triangleFSIBlend.frag.spv");
+		// Main entry point for the shader
+		shaderStages[1].pName = "main";
+		assert(shaderStages[1].module != VK_NULL_HANDLE);
+
+		// Create rendering pipeline using the specified states
+		VK_CHECK_RESULT(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineCI, nullptr, &pipelineBlend));
 
 		// Shader modules are no longer needed once the graphics pipeline has been created
 		vkDestroyShaderModule(device, shaderStages[0].module, nullptr);
@@ -898,6 +1455,10 @@ public:
 		createCommandBuffers();
 		createVertexBuffer();
 		createUniformBuffers();
+		makeBaseTexture();
+		makeBlendTexture();
+		createSourceTextures();
+		createFSIImages();
 		createDescriptorSetLayout();
 		createDescriptorPool();
 		createDescriptorSets();
@@ -967,6 +1528,62 @@ public:
 		const VkCommandBuffer commandBuffer = commandBuffers[currentFrame];
 		VK_CHECK_RESULT(vkBeginCommandBuffer(commandBuffer, &cmdBufInfo));
 
+		// Clear the FSI images
+		{
+			VkImageMemoryBarrier barrier;
+			barrier = vks::initializers::imageMemoryBarrier();
+			barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+			barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			barrier.subresourceRange.levelCount = 1;
+			barrier.subresourceRange.layerCount = 1;
+
+			// Color barrier
+			barrier.image = fsiImageColor.image;
+			vkCmdPipelineBarrier(commandBuffers[currentFrame], VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+			// Depth barrier
+			barrier.image = fsiImageDepth.image;
+			vkCmdPipelineBarrier(commandBuffers[currentFrame], VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+			VkClearColorValue clearValuesFSI[2] = {
+				{ 0.0f, 0.0f, 0.2f, 0.0f }, // color
+				{ 1.0f, 0.0f, 0.0f, 0.0f }, // depth
+			};
+			VkImageSubresourceRange range{};
+			range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			range.baseMipLevel = 0;
+			range.levelCount = 1;
+			range.baseArrayLayer = 0;
+			range.layerCount = 1;
+
+			// Clear color
+			vkCmdClearColorImage(commandBuffers[currentFrame], fsiImageColor.image, VK_IMAGE_LAYOUT_GENERAL, &clearValuesFSI[0], 1, &range);
+
+			// Clear depth
+			vkCmdClearColorImage(commandBuffers[currentFrame], fsiImageDepth.image, VK_IMAGE_LAYOUT_GENERAL, &clearValuesFSI[1], 1, &range);
+
+			barrier = vks::initializers::imageMemoryBarrier();
+			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			barrier.subresourceRange.levelCount = 1;
+			barrier.subresourceRange.layerCount = 1;
+
+			// Color barrier
+			barrier.image = fsiImageColor.image;
+			vkCmdPipelineBarrier(commandBuffers[currentFrame], VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+			// Depth barrier
+			barrier.image = fsiImageDepth.image;
+			vkCmdPipelineBarrier(commandBuffers[currentFrame], VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+		}
+
+
 		// Start the first sub pass specified in our default render pass setup by the base class
 		// This will clear the color and depth attachment
 		vkCmdBeginRenderPass(commandBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
@@ -986,16 +1603,24 @@ public:
 		vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 		// Bind descriptor set for the current frame's uniform buffer, so the shader uses the data from that buffer for this draw
 		vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &uniformBuffers[currentFrame].descriptorSet, 0, nullptr);
-		// Bind the rendering pipeline
-		// The pipeline (state object) contains all states of the rendering pipeline, binding it will set all the states specified at pipeline creation time
-		vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 		// Bind triangle vertex buffer (contains position and colors)
 		VkDeviceSize offsets[1]{ 0 };
 		vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertices.buffer, offsets);
 		// Bind triangle index buffer
 		vkCmdBindIndexBuffer(commandBuffer, indices.buffer, 0, VK_INDEX_TYPE_UINT32);
-		// Draw indexed triangle
-		vkCmdDrawIndexed(commandBuffer, indices.count, 1, 0, 0, 0);
+		// Draw the cube one at a time
+		for (uint32_t baseIndex = 0; baseIndex < indices.count; baseIndex += static_cast<uint32_t>(cubeIndices.size()))
+		{
+			// Do the base and blend passes
+			for (int i = 0; i < 2; i++)
+			{
+				// Bind the rendering pipeline
+				// The pipeline (state object) contains all states of the rendering pipeline, binding it will set all the states specified at pipeline creation time
+				vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, i == 0 ? pipelineBase : pipelineBlend);
+				// Draw indexed triangle
+				vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(cubeIndices.size()), 1, baseIndex, 0, 0);
+			}
+		}
 		vkCmdEndRenderPass(commandBuffer);
 		// Ending the render pass will add an implicit barrier transitioning the frame buffer color attachment to
 		// VK_IMAGE_LAYOUT_PRESENT_SRC_KHR for presenting it to the windowing system
@@ -1044,6 +1669,186 @@ public:
 
 		// Select the next frame to render to, based on the max. no. of concurrent frames
 		currentFrame = (currentFrame + 1) % MAX_CONCURRENT_FRAMES;
+	}
+
+	void getEnabledFeatures() override
+	{
+		if (deviceFeatures.fragmentStoresAndAtomics)
+		{
+			enabledFeatures.fragmentStoresAndAtomics = VK_TRUE;
+		}
+		else
+		{
+			vks::tools::exitFatal("Selected GPU does not support stores and atomic operations in the fragment stage", VK_ERROR_FEATURE_NOT_PRESENT);
+		}
+	}
+
+	void getEnabledExtensions() override
+	{
+		// Make sure fragment shader interlock is enabled
+		enabledDeviceExtensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
+
+		// Make sure the features is visible
+		extInterlock.pNext = deviceCreatepNextChain;
+		deviceCreatepNextChain = &extInterlock;
+	}
+
+	static constexpr int texWidth = 256;
+	static constexpr int texHeight = 256;
+
+	enum
+	{
+		textureBase,
+		textureBlend,
+		numTextures,
+	};
+
+	uint8_t textureData[numTextures][texWidth * texHeight * 4];
+
+	// Cube vertices. Generated with ChatGPT.
+	static constexpr std::array<Vertex, 24> cubeVertices = {{
+		// ---- Front (+Z) ----
+		{ {-0.5f, -0.5f,  0.5f}, {1.0f, 0.0f, 0.0f, 0.5f}, {0.0f, 0.0f} }, // 0
+		{ { 0.5f, -0.5f,  0.5f}, {1.0f, 0.0f, 0.0f, 0.5f}, {1.0f, 0.0f} }, // 1
+		{ { 0.5f,  0.5f,  0.5f}, {1.0f, 0.0f, 0.0f, 0.5f}, {1.0f, 1.0f} }, // 2
+		{ {-0.5f,  0.5f,  0.5f}, {1.0f, 0.0f, 0.0f, 0.5f}, {0.0f, 1.0f} }, // 3
+
+		// ---- Back (-Z) ----
+		{ { 0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f, 0.5f}, {0.0f, 0.0f} }, // 4
+		{ {-0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f, 0.5f}, {1.0f, 0.0f} }, // 5
+		{ {-0.5f,  0.5f, -0.5f}, {0.0f, 1.0f, 0.0f, 0.5f}, {1.0f, 1.0f} }, // 6
+		{ { 0.5f,  0.5f, -0.5f}, {0.0f, 1.0f, 0.0f, 0.5f}, {0.0f, 1.0f} }, // 7
+
+		// ---- Left (-X) ----
+		{ {-0.5f, -0.5f, -0.5f}, {0.0f, 0.0f, 1.0f, 0.5f}, {0.0f, 0.0f} }, // 8
+		{ {-0.5f, -0.5f,  0.5f}, {0.0f, 0.0f, 1.0f, 0.5f}, {1.0f, 0.0f} }, // 9
+		{ {-0.5f,  0.5f,  0.5f}, {0.0f, 0.0f, 1.0f, 0.5f}, {1.0f, 1.0f} }, // 10
+		{ {-0.5f,  0.5f, -0.5f}, {0.0f, 0.0f, 1.0f, 0.5f}, {0.0f, 1.0f} }, // 11
+
+		// ---- Right (+X) ----
+		{ {0.5f, -0.5f,  0.5f}, {1.0f, 0.0f, 1.0f, 0.5f}, {0.0f, 0.0f} }, // 12
+		{ {0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 1.0f, 0.5f}, {1.0f, 0.0f} }, // 13
+		{ {0.5f,  0.5f, -0.5f}, {1.0f, 0.0f, 1.0f, 0.5f}, {1.0f, 1.0f} }, // 14
+		{ {0.5f,  0.5f,  0.5f}, {1.0f, 0.0f, 1.0f, 0.5f}, {0.0f, 1.0f} }, // 15
+
+		// ---- Top (+Y) ----
+		{ {-0.5f,  0.5f,  0.5f}, {1.0f, 1.0f, 0.0f, 0.5f}, {0.0f, 0.0f} }, // 16
+		{ { 0.5f,  0.5f,  0.5f}, {1.0f, 1.0f, 0.0f, 0.5f}, {1.0f, 0.0f} }, // 17
+		{ { 0.5f,  0.5f, -0.5f}, {1.0f, 1.0f, 0.0f, 0.5f}, {1.0f, 1.0f} }, // 18
+		{ {-0.5f,  0.5f, -0.5f}, {1.0f, 1.0f, 0.0f, 0.5f}, {0.0f, 1.0f} }, // 19
+
+		// ---- Bottom (-Y) ----
+		{ {-0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 1.0f, 0.5f}, {0.0f, 0.0f} }, // 20
+		{ { 0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 1.0f, 0.5f}, {1.0f, 0.0f} }, // 21
+		{ { 0.5f, -0.5f,  0.5f}, {0.0f, 1.0f, 1.0f, 0.5f}, {1.0f, 1.0f} }, // 22
+		{ {-0.5f, -0.5f,  0.5f}, {0.0f, 1.0f, 1.0f, 0.5f}, {0.0f, 1.0f} }, // 23
+	}};
+
+	// Cube indices. Generated with ChatGPT.
+	static constexpr std::array<uint32_t, 36> cubeIndices = {
+		0,1,2,  0,2,3,       // Front
+		4,5,6,  4,6,7,       // Back
+		8,9,10, 8,10,11,     // Left
+		12,13,14, 12,14,15,  // Right
+		16,17,18, 16,18,19,  // Top
+		20,21,22, 20,22,23   // Bottom
+	};
+
+	// Vertices after applying rotation/translation.
+	std::array<Vertex, 24> cubeVerticesTransformed;
+
+	// Transform by rotating and translating.
+	void transformVertices(float cx, float cy, float cz, float angle_x, float angle_y)
+	{
+		const float fw = (float)width;
+		const float fh = (float)height;
+
+		const float aspect = fw / fh;
+
+		float cosx = cosf(angle_x * (std::numbers::pi_v<float> / 180.0f));
+		float sinx = sinf(angle_x * (std::numbers::pi_v<float> / 180.0f));
+		float cosy = cosf(angle_y * (std::numbers::pi_v<float> / 180.0f));
+		float siny = sinf(angle_y * (std::numbers::pi_v<float> / 180.0f));
+
+		for (int i = 0; i < std::size(cubeVertices); i++)
+		{
+			float x = cubeVertices[i].position[0];
+			float y = cubeVertices[i].position[1];
+			float z = cubeVertices[i].position[2];
+
+			// ---- Rotate around X ----
+			float x1 = x;
+			float y1 = y * cosx - z * sinx;
+			float z1 = y * sinx + z * cosx;
+
+			// ---- Rotate around Y ----
+			float x2 = x1 * cosy + z1 * siny;
+			float y2 = y1;
+			float z2 = -x1 * siny + z1 * cosy;
+
+			// ---- Translate by center ----
+			float x3 = x2 + cx;
+			float y3 = y2 + cy;
+			float z3 = z2 + cz;
+
+			cubeVerticesTransformed[i] = cubeVertices[i];
+			cubeVerticesTransformed[i].position[0] = x3;
+			cubeVerticesTransformed[i].position[1] = y3;
+			cubeVerticesTransformed[i].position[2] = z3;
+		}
+	}
+
+	// Texture for the base draw. In Black it's the diffuse texture,
+	// The alpha channel of this texture is used to modulate the specular texture
+	// on the second draw with the blend set to Cs * Ad + Cd.
+	void makeBaseTexture()
+	{
+		for (int y = 0; y < texHeight; y++)
+		{
+			for (int x = 0; x < texWidth; x++)
+			{
+				const int i = (y * texWidth + x) * 4; // Pixel index
+
+				// Gradient for base texture
+				const int dx = abs(2 * x - texWidth);
+				const int dy = abs(2 * y - texHeight);
+				const float df = ((float)dx + (float)dy) / (float)(texWidth + texHeight);
+				int gray = (int)(0x20 + (1.0f - df) * 0x40);
+
+				textureData[0][i + 0] = gray;
+				textureData[0][i + 1] = gray;
+				textureData[0][i + 2] = gray;
+				textureData[0][i + 3] = gray;
+			}
+		}
+	}
+
+	// Texture used for the blend draws. In Black it's the specular texture.
+	void makeBlendTexture()
+	{
+		for (int y = 0; y < texHeight; y++)
+		{
+			for (int x = 0; x < texWidth; x++)
+			{
+				const int i = (y * texWidth + x) * 4; // Pixel index
+
+				// Checkerboard for the blending texture
+				if (((x / 16) + (y / 16)) & 1)
+				{
+					textureData[textureBlend][i + 0] = 0x20;
+					textureData[textureBlend][i + 1] = 0x20;
+					textureData[textureBlend][i + 2] = 0x20;
+					textureData[textureBlend][i + 3] = 0xFF;
+				}
+				else
+				{
+					textureData[textureBlend][i + 0] = 0x40;
+					textureData[textureBlend][i + 1] = 0x40;
+					textureData[textureBlend][i + 2] = 0x40;
+					textureData[textureBlend][i + 3] = 0xFF;
+				}
+			}
+		}
 	}
 };
 
