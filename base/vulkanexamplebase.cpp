@@ -871,21 +871,6 @@ VulkanExampleBase::VulkanExampleBase()
 	}
 #endif
 
-#if !defined(VK_USE_PLATFORM_ANDROID_KHR)
-	// Check for a valid asset path
-	struct stat info;
-	if (stat(getAssetPath().c_str(), &info) != 0)
-	{
-#if defined(_WIN32)
-		std::string msg = "Could not locate asset path in \"" + getAssetPath() + "\" !";
-		MessageBox(NULL, msg.c_str(), "Fatal error", MB_OK | MB_ICONERROR);
-#else
-		std::cerr << "Error: Could not find asset path in " << getAssetPath() << "\n";
-#endif
-		exit(-1);
-	}
-#endif
-
 	// Validation for all samples can be forced at compile time using the FORCE_VALIDATION define
 #if defined(FORCE_VALIDATION)
 	settings.validation = true;
