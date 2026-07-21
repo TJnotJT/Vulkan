@@ -37,12 +37,10 @@ constexpr auto MAX_CONCURRENT_FRAMES = 2;
 class VulkanExample : public VulkanExampleBase
 {
 public:
-	VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT extInterlock {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT,
+	VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT extFeedbackLoopLayout {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT,
 		.pNext = nullptr,
-		.fragmentShaderSampleInterlock = VK_FALSE,
-		.fragmentShaderPixelInterlock = VK_TRUE,
-		.fragmentShaderShadingRateInterlock = VK_FALSE
+		.attachmentFeedbackLoopLayout = true,
 	};
 
 	// Vertex layout used in this example
@@ -93,11 +91,14 @@ public:
 		glm::mat4 projectionMatrix;
 		glm::mat4 modelMatrix;
 		glm::mat4 viewMatrix;
+		glm::vec4 rtSize;
 	};
 
+	VkFramebuffer feedbackFrameBuffer;
+
 	// Texture to draw to.
-	vks::Texture fsiImageColor;
-	vks::Texture fsiImageDepth;
+	vks::Texture feedbackImageColor;
+	vks::Texture feedbackImageDepth;
 
 	// Textures to sample from.
 	vks::Texture imageBase;
@@ -151,8 +152,8 @@ public:
 		// Clean up used Vulkan resources
 		// Note: Inherited destructor cleans up resources stored in base class
 		if (device) {
-			fsiImageColor.destroy();
-			fsiImageDepth.destroy();
+			feedbackImageColor.destroy();
+			feedbackImageDepth.destroy();
 			imageBase.destroy();
 			imageBlend.destroy();
 			vkDestroyPipeline(device, pipelineBase, nullptr);
@@ -256,13 +257,13 @@ public:
 		std::vector<uint32_t> indexBuffer;
 
 		// Translate and replicate the cube in a 3D grid
-		for (int i = 0; i < 11; i++)
+		for (int i = 0; i < 5; i++)
 		{
-			for (int j = 0; j < 11; j++)
+			for (int j = 0; j < 5; j++)
 			{
-				for (int k = 0; k < 11; k++)
+				for (int k = 0; k < 5; k++)
 				{
-					transformVertices(1.25f * (float)(j - 5), 1.25f * (float)(k - 5), -1.25f * (float)(11 - i), 0.0f, 0.0f);
+					transformVertices(1.25f * (float)(j - 2), 1.25f * (float)(k - 2), -1.25f * (float)(5 - i), 0.0f, 0.0f);
 
 					for (uint32_t index : cubeIndices)
 					{
@@ -418,7 +419,7 @@ public:
 	void createDescriptorPool()
 	{
 		// We need to tell the API the number of max. requested descriptors per type
-		std::array<VkDescriptorPoolSize, 3> descriptorTypeCounts{};
+		std::array<VkDescriptorPoolSize, 2> descriptorTypeCounts{};
 		// This example only one descriptor type (uniform buffer)
 		descriptorTypeCounts[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 		// We have one buffer (and as such descriptor) per frame
@@ -428,13 +429,9 @@ public:
 		// typeCounts[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 		// typeCounts[1].descriptorCount = 2;
 
-		// Descriptors for FSI drawing.
-		descriptorTypeCounts[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-		descriptorTypeCounts[1].descriptorCount = 2 * MAX_CONCURRENT_FRAMES;
-
 		// Source textures
-		descriptorTypeCounts[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-		descriptorTypeCounts[2].descriptorCount = 2 * MAX_CONCURRENT_FRAMES;
+		descriptorTypeCounts[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		descriptorTypeCounts[1].descriptorCount = 4 * MAX_CONCURRENT_FRAMES;
 
 		// Create the global descriptor pool
 		// All descriptors used in this example are allocated from this pool
@@ -460,19 +457,19 @@ public:
 		layoutBindings[0].binding = 0;
 		layoutBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 		layoutBindings[0].descriptorCount = 1;
-		layoutBindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+		layoutBindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 		layoutBindings[0].pImmutableSamplers = nullptr;
 
 		// Binding 1: Storage image (fragment shader)
 		layoutBindings[1].binding = 1;
-		layoutBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+		layoutBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 		layoutBindings[1].descriptorCount = 1;
 		layoutBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 		layoutBindings[1].pImmutableSamplers = nullptr;
 
 		// Binding 2: Storage image (fragment shader)
 		layoutBindings[2].binding = 2;
-		layoutBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+		layoutBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 		layoutBindings[2].descriptorCount = 1;
 		layoutBindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 		layoutBindings[2].pImmutableSamplers = nullptr;
@@ -534,16 +531,16 @@ public:
 			writeDescriptorSet[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 			writeDescriptorSet[1].dstSet = uniformBuffers[i].descriptorSet;
 			writeDescriptorSet[1].descriptorCount = 1;
-			writeDescriptorSet[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-			writeDescriptorSet[1].pImageInfo = &fsiImageColor.descriptor;
+			writeDescriptorSet[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			writeDescriptorSet[1].pImageInfo = &feedbackImageColor.descriptor;
 			writeDescriptorSet[1].dstBinding = 1;
 
 			// Binding 2 : Storage image
 			writeDescriptorSet[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 			writeDescriptorSet[2].dstSet = uniformBuffers[i].descriptorSet;
 			writeDescriptorSet[2].descriptorCount = 1;
-			writeDescriptorSet[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-			writeDescriptorSet[2].pImageInfo = &fsiImageDepth.descriptor;
+			writeDescriptorSet[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			writeDescriptorSet[2].pImageInfo = &feedbackImageDepth.descriptor;
 			writeDescriptorSet[2].dstBinding = 2;
 
 			// Binding 3 : Sampled image
@@ -616,32 +613,27 @@ public:
 		VK_CHECK_RESULT(vkCreateImageView(device, &depthStencilViewCI, nullptr, &depthStencil.view));
 	}
 
-	// Create a frame buffer for each swap chain image
-	// Note: Override of virtual function in the base class and called from within VulkanExampleBase::prepare
 	void setupFrameBuffer() override
 	{
-		// Create a frame buffer for every image in the swapchain
-		frameBuffers.resize(swapChain.images.size());
-		for (size_t i = 0; i < frameBuffers.size(); i++)
-		{
-			std::array<VkImageView, 2> attachments{};
-			// Color attachment is the view of the swapchain image
-			attachments[0] = swapChain.imageViews[i];
-			// Depth/Stencil attachment is the same for all frame buffers due to how depth works with current GPUs
-			attachments[1] = depthStencil.view;         
+	}
 
-			VkFramebufferCreateInfo frameBufferCI{};
-			frameBufferCI.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-			// All frame buffers use the same renderpass setup
-			frameBufferCI.renderPass = renderPass;
-			frameBufferCI.attachmentCount = static_cast<uint32_t>(attachments.size());
-			frameBufferCI.pAttachments = attachments.data();
-			frameBufferCI.width = width;
-			frameBufferCI.height = height;
-			frameBufferCI.layers = 1;
-			// Create the framebuffer
-			VK_CHECK_RESULT(vkCreateFramebuffer(device, &frameBufferCI, nullptr, &frameBuffers[i]));
-		}
+	void createFeedbackFrameBuffer()
+	{
+		std::array<VkImageView, 2> attachments{};
+		attachments[0] = feedbackImageColor.view;
+		attachments[1] = feedbackImageDepth.view;
+
+		VkFramebufferCreateInfo frameBufferCI{};
+		frameBufferCI.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+		// All frame buffers use the same renderpass setup
+		frameBufferCI.renderPass = renderPass;
+		frameBufferCI.attachmentCount = static_cast<uint32_t>(attachments.size());
+		frameBufferCI.pAttachments = attachments.data();
+		frameBufferCI.width = width;
+		frameBufferCI.height = height;
+		frameBufferCI.layers = 1;
+		// Create the framebuffer
+		VK_CHECK_RESULT(vkCreateFramebuffer(device, &frameBufferCI, nullptr, &feedbackFrameBuffer));
 	}
 
 	// Render pass setup
@@ -657,33 +649,33 @@ public:
 		std::array<VkAttachmentDescription, 2> attachments{};
 
 		// Color attachment
-		attachments[0].format = swapChain.colorFormat;                                  // Use the color format selected by the swapchain
+		attachments[0].format = VK_FORMAT_R8G8B8A8_UNORM;                         // Use the color format selected by the swapchain
 		attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;                                 // We don't use multi sampling in this example
 		attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;                            // Clear this attachment at the start of the render pass
 		attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;                          // Keep its contents after the render pass is finished (for displaying it)
 		attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;                 // We don't use stencil, so don't care for load
 		attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;               // Same for store
 		attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;                       // Layout at render pass start. Initial doesn't matter, so we use undefined
-		attachments[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;                   // Layout to which the attachment is transitioned when the render pass is finished
+		attachments[0].finalLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;                   // Layout to which the attachment is transitioned when the render pass is finished
 		                                                                                // As we want to present the color buffer to the swapchain, we transition to PRESENT_KHR
 		// Depth attachment
-		attachments[1].format = depthFormat;                                           // A proper depth format is selected in the example base
+		attachments[1].format = VK_FORMAT_D32_SFLOAT;                                           // A proper depth format is selected in the example base
 		attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
 		attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;                           // Clear depth at start of first subpass
 		attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;                     // We don't need depth after render pass has finished (DONT_CARE may result in better performance)
 		attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;                // No stencil
 		attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;              // No Stencil
 		attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;                      // Layout at render pass start. Initial doesn't matter, so we use undefined
-		attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL; // Transition to depth/stencil attachment
+		attachments[1].finalLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT; // Transition to depth/stencil attachment
 
 		// Setup attachment references
 		VkAttachmentReference colorReference{};
 		colorReference.attachment = 0;                                    // Attachment 0 is color
-		colorReference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; // Attachment layout used as color during the subpass
+		colorReference.layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT; // Attachment layout used as color during the subpass
 
 		VkAttachmentReference depthReference{};
 		depthReference.attachment = 1;                                            // Attachment 1 is color
-		depthReference.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL; // Attachment used as depth/stencil used during the subpass
+		depthReference.layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT; // Attachment used as depth/stencil used during the subpass
 
 		// Setup a single subpass reference
 		VkSubpassDescription subpassDescription{};
@@ -706,22 +698,22 @@ public:
 		std::array<VkSubpassDependency, 2> dependencies{};
 
 		// Does the transition from final to initial layout for the depth an color attachments
-		// Depth attachment
-		dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-		dependencies[0].dstSubpass = 0;
-		dependencies[0].srcStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-		dependencies[0].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-		dependencies[0].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-		dependencies[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-		dependencies[0].dependencyFlags = 0;
 		// Color attachment
-		dependencies[1].srcSubpass = VK_SUBPASS_EXTERNAL;
+		dependencies[0].srcSubpass = 0;
+		dependencies[0].dstSubpass = 0;
+		dependencies[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+		dependencies[0].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+		dependencies[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		dependencies[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		dependencies[0].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT | VK_DEPENDENCY_FEEDBACK_LOOP_BIT_EXT;
+		// Depth attachment
+		dependencies[1].srcSubpass = 0;
 		dependencies[1].dstSubpass = 0;
-		dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-		dependencies[1].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-		dependencies[1].srcAccessMask = 0;
-		dependencies[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
-		dependencies[1].dependencyFlags = 0;
+		dependencies[1].srcStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+		dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+		dependencies[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+		dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		dependencies[1].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT | VK_DEPENDENCY_FEEDBACK_LOOP_BIT_EXT;
 
 		// Create the actual renderpass
 		VkRenderPassCreateInfo renderPassCI{};
@@ -735,12 +727,12 @@ public:
 		VK_CHECK_RESULT(vkCreateRenderPass(device, &renderPassCI, nullptr, &renderPass));
 	}
 
-	// Setup the FSI images
-	void createFSIImages()
+	// Setup the feedback images
+	void createFeedbackImages()
 	{
 		// Color image
 		{
-			fsiImageColor.device = vulkanDevice;
+			feedbackImageColor.device = vulkanDevice;
 
 			VkImageCreateInfo imageInfo = vks::initializers::imageCreateInfo();
 			imageInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -758,51 +750,80 @@ public:
 #else
 			imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
 #endif
-			imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+			imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+				VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT |
+				VK_IMAGE_USAGE_SAMPLED_BIT;
 
-			VK_CHECK_RESULT(vkCreateImage(device, &imageInfo, nullptr, &fsiImageColor.image));
+			VK_CHECK_RESULT(vkCreateImage(device, &imageInfo, nullptr, &feedbackImageColor.image));
 
-			fsiImageColor.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			feedbackImageColor.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
 			VkMemoryRequirements memReqs;
-			vkGetImageMemoryRequirements(device, fsiImageColor.image, &memReqs);
+			vkGetImageMemoryRequirements(device, feedbackImageColor.image, &memReqs);
 
 			VkMemoryAllocateInfo memAlloc = vks::initializers::memoryAllocateInfo();
 			memAlloc.allocationSize = memReqs.size;
 			memAlloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-			VK_CHECK_RESULT(vkAllocateMemory(device, &memAlloc, nullptr, &fsiImageColor.deviceMemory));
-			VK_CHECK_RESULT(vkBindImageMemory(device, fsiImageColor.image, fsiImageColor.deviceMemory, 0));
+			VK_CHECK_RESULT(vkAllocateMemory(device, &memAlloc, nullptr, &feedbackImageColor.deviceMemory));
+			VK_CHECK_RESULT(vkBindImageMemory(device, feedbackImageColor.image, feedbackImageColor.deviceMemory, 0));
 
 			VkImageViewCreateInfo imageViewInfo = vks::initializers::imageViewCreateInfo();
 			imageViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
 			imageViewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
 			imageViewInfo.flags = 0;
-			imageViewInfo.image = fsiImageColor.image;
+			imageViewInfo.image = feedbackImageColor.image;
 			imageViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 			imageViewInfo.subresourceRange.baseMipLevel = 0;
 			imageViewInfo.subresourceRange.levelCount = 1;
 			imageViewInfo.subresourceRange.baseArrayLayer = 0;
 			imageViewInfo.subresourceRange.layerCount = 1;
 
-			VK_CHECK_RESULT(vkCreateImageView(device, &imageViewInfo, nullptr, &fsiImageColor.view));
+			VK_CHECK_RESULT(vkCreateImageView(device, &imageViewInfo, nullptr, &feedbackImageColor.view));
 
-			fsiImageColor.width = width;
-			fsiImageColor.height = height;
-			fsiImageColor.mipLevels = 1;
-			fsiImageColor.layerCount = 1;
-			fsiImageColor.descriptor.imageView = fsiImageColor.view;
-			fsiImageColor.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-			fsiImageColor.sampler = VK_NULL_HANDLE;
+			VkSamplerCreateInfo samplerInfo{};
+			samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+
+			// Bilinear filtering
+			samplerInfo.magFilter = VK_FILTER_NEAREST;   // magnification
+			samplerInfo.minFilter = VK_FILTER_NEAREST;   // minification
+
+			// No mipmapping (pure bilinear)
+			samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+			samplerInfo.minLod = 0.0f;
+			samplerInfo.maxLod = 0.0f;
+
+			// Addressing mode
+			samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+			samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+			samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+
+			// Optional settings
+			samplerInfo.anisotropyEnable = VK_FALSE;
+			samplerInfo.compareEnable = VK_FALSE;
+			samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+			samplerInfo.unnormalizedCoordinates = VK_FALSE;
+
+			VkSampler sampler;
+			VK_CHECK_RESULT(vkCreateSampler(device, &samplerInfo, nullptr, &sampler));
+
+			feedbackImageColor.width = width;
+			feedbackImageColor.height = height;
+			feedbackImageColor.mipLevels = 1;
+			feedbackImageColor.layerCount = 1;
+			feedbackImageColor.descriptor.imageView = feedbackImageColor.view;
+			feedbackImageColor.descriptor.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+			feedbackImageColor.descriptor.sampler = sampler;
+			feedbackImageColor.sampler = sampler;
 		}
 
 		// Depth image
 		{
-			fsiImageDepth.device = vulkanDevice;
+			feedbackImageDepth.device = vulkanDevice;
 
 			VkImageCreateInfo imageInfo = vks::initializers::imageCreateInfo();
 			imageInfo.imageType = VK_IMAGE_TYPE_2D;
-			imageInfo.format = VK_FORMAT_R32_SFLOAT;
+			imageInfo.format = VK_FORMAT_D32_SFLOAT;
 			imageInfo.extent.width = width;
 			imageInfo.extent.height = height;
 			imageInfo.extent.depth = 1;
@@ -816,80 +837,146 @@ public:
 #else
 			imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
 #endif
-			imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+			imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | 
+				VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT |
+				VK_IMAGE_USAGE_SAMPLED_BIT;
 
-			VK_CHECK_RESULT(vkCreateImage(device, &imageInfo, nullptr, &fsiImageDepth.image));
+			VK_CHECK_RESULT(vkCreateImage(device, &imageInfo, nullptr, &feedbackImageDepth.image));
 
-			fsiImageDepth.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			feedbackImageDepth.imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
 			VkMemoryRequirements memReqs;
-			vkGetImageMemoryRequirements(device, fsiImageDepth.image, &memReqs);
+			vkGetImageMemoryRequirements(device, feedbackImageDepth.image, &memReqs);
 
 			VkMemoryAllocateInfo memAlloc = vks::initializers::memoryAllocateInfo();
 			memAlloc.allocationSize = memReqs.size;
 			memAlloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-			VK_CHECK_RESULT(vkAllocateMemory(device, &memAlloc, nullptr, &fsiImageDepth.deviceMemory));
-			VK_CHECK_RESULT(vkBindImageMemory(device, fsiImageDepth.image, fsiImageDepth.deviceMemory, 0));
+			VK_CHECK_RESULT(vkAllocateMemory(device, &memAlloc, nullptr, &feedbackImageDepth.deviceMemory));
+			VK_CHECK_RESULT(vkBindImageMemory(device, feedbackImageDepth.image, feedbackImageDepth.deviceMemory, 0));
 
 			VkImageViewCreateInfo imageViewInfo = vks::initializers::imageViewCreateInfo();
 			imageViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-			imageViewInfo.format = VK_FORMAT_R32_SFLOAT;
+			imageViewInfo.format = VK_FORMAT_D32_SFLOAT;
 			imageViewInfo.flags = 0;
-			imageViewInfo.image = fsiImageDepth.image;
-			imageViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			imageViewInfo.image = feedbackImageDepth.image;
+			imageViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
 			imageViewInfo.subresourceRange.baseMipLevel = 0;
 			imageViewInfo.subresourceRange.levelCount = 1;
 			imageViewInfo.subresourceRange.baseArrayLayer = 0;
 			imageViewInfo.subresourceRange.layerCount = 1;
 
-			VK_CHECK_RESULT(vkCreateImageView(device, &imageViewInfo, nullptr, &fsiImageDepth.view));
+			VK_CHECK_RESULT(vkCreateImageView(device, &imageViewInfo, nullptr, &feedbackImageDepth.view));
 
-			fsiImageDepth.width = width;
-			fsiImageDepth.height = height;
-			fsiImageDepth.mipLevels = 1;
-			fsiImageDepth.layerCount = 1;
-			fsiImageDepth.descriptor.imageView = fsiImageDepth.view;
-			fsiImageDepth.descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-			fsiImageDepth.sampler = VK_NULL_HANDLE;
+			VkSamplerCreateInfo samplerInfo{};
+			samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+
+			// Bilinear filtering
+			samplerInfo.magFilter = VK_FILTER_NEAREST;   // magnification
+			samplerInfo.minFilter = VK_FILTER_NEAREST;   // minification
+
+			// No mipmapping (pure bilinear)
+			samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+			samplerInfo.minLod = 0.0f;
+			samplerInfo.maxLod = 0.0f;
+
+			// Addressing mode
+			samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+			samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+			samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+
+			// Optional settings
+			samplerInfo.anisotropyEnable = VK_FALSE;
+			samplerInfo.compareEnable = VK_FALSE;
+			samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+			samplerInfo.unnormalizedCoordinates = VK_FALSE;
+
+			VkSampler sampler;
+			VK_CHECK_RESULT(vkCreateSampler(device, &samplerInfo, nullptr, &sampler));
+
+			feedbackImageDepth.width = width;
+			feedbackImageDepth.height = height;
+			feedbackImageDepth.mipLevels = 1;
+			feedbackImageDepth.layerCount = 1;
+			feedbackImageDepth.descriptor.imageView = feedbackImageDepth.view;
+			feedbackImageDepth.descriptor.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+			feedbackImageDepth.descriptor.sampler = sampler;
+			feedbackImageDepth.sampler = sampler;
 		}
+	}
 
+	void transitionImages()
+	{
 		// Transition the images from UNDEFINED to GENERAL
+		VkCommandBufferAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		allocInfo.commandPool = commandPool;
+		allocInfo.commandBufferCount = 1;
+
+		VkCommandBuffer commandBuffer;
+		vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
+
+		VkCommandBufferBeginInfo beginInfo{};
+		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+		vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+		VkImageMemoryBarrier barrier;
+		barrier = vks::initializers::imageMemoryBarrier();
+		barrier.srcAccessMask = VK_ACCESS_NONE;
+		barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		barrier.newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+		barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		barrier.subresourceRange.levelCount = 1;
+		barrier.subresourceRange.layerCount = 1;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+
+		barrier.image = feedbackImageColor.image;
+		barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		barrier.subresourceRange.baseMipLevel = 0;
+		barrier.subresourceRange.levelCount = 1;
+		barrier.subresourceRange.baseArrayLayer = 0;
+		barrier.subresourceRange.layerCount = 1;
+
+		// Color
+		vkCmdPipelineBarrier(
+			commandBuffer,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT,
+			0,
+			0, nullptr,
+			0, nullptr,
+			1, &barrier);
+
+		feedbackImageColor.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+
+		barrier.newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+		barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+		barrier.image = feedbackImageDepth.image;
+
+		// Depth
+		vkCmdPipelineBarrier(
+			commandBuffer,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT,
+			0,
+			0, nullptr,
+			0, nullptr,
+			1, &barrier);
+
+		feedbackImageDepth.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+
+		for (uint32_t i = 0; i < swapChain.imageCount; i++)
 		{
-			VkCommandBufferAllocateInfo allocInfo{};
-			allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-			allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-			allocInfo.commandPool = commandPool;
-			allocInfo.commandBufferCount = 1;
-
-			VkCommandBuffer commandBuffer;
-			vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
-
-			VkCommandBufferBeginInfo beginInfo{};
-			beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-			beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-			vkBeginCommandBuffer(commandBuffer, &beginInfo);
-
-			VkImageMemoryBarrier barrier;
-			barrier = vks::initializers::imageMemoryBarrier();
-			barrier.srcAccessMask = VK_ACCESS_NONE;
-			barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-			barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-			barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-			barrier.subresourceRange.levelCount = 1;
-			barrier.subresourceRange.layerCount = 1;
-			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.image = swapChain.images[i];
 
-			barrier.image = fsiImageColor.image;
-			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-			barrier.subresourceRange.baseMipLevel = 0;
-			barrier.subresourceRange.levelCount = 1;
-			barrier.subresourceRange.baseArrayLayer = 0;
-			barrier.subresourceRange.layerCount = 1;
-
+			// Swapchain images
 			vkCmdPipelineBarrier(
 				commandBuffer,
 				VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -898,45 +985,30 @@ public:
 				0, nullptr,
 				0, nullptr,
 				1, &barrier);
-
-			fsiImageColor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-			barrier.image = fsiImageDepth.image;
-
-			vkCmdPipelineBarrier(
-				commandBuffer,
-				VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-				VK_PIPELINE_STAGE_TRANSFER_BIT,
-				0,
-				0, nullptr,
-				0, nullptr,
-				1, &barrier);
-
-			fsiImageDepth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-			vkEndCommandBuffer(commandBuffer);
-
-			// Submit the command buffer to the queue to finish the copy
-			VkSubmitInfo submitInfo{};
-			submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-			submitInfo.commandBufferCount = 1;
-			submitInfo.pCommandBuffers = &commandBuffer;
-
-			// Create fence to ensure that the command buffer has finished executing
-			VkFenceCreateInfo fenceCI{};
-			fenceCI.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-			fenceCI.flags = 0;
-			VkFence fence;
-			VK_CHECK_RESULT(vkCreateFence(device, &fenceCI, nullptr, &fence));
-
-			// Submit to the queue
-			VK_CHECK_RESULT(vkQueueSubmit(queue, 1, &submitInfo, fence));
-			// Wait for the fence to signal that command buffer has finished executing
-			VK_CHECK_RESULT(vkWaitForFences(device, 1, &fence, VK_TRUE, DEFAULT_FENCE_TIMEOUT));
-
-			vkDestroyFence(device, fence, nullptr);
-			vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
 		}
+
+		vkEndCommandBuffer(commandBuffer);
+
+		// Submit the command buffer to the queue to finish the copy
+		VkSubmitInfo submitInfo{};
+		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		submitInfo.commandBufferCount = 1;
+		submitInfo.pCommandBuffers = &commandBuffer;
+
+		// Create fence to ensure that the command buffer has finished executing
+		VkFenceCreateInfo fenceCI{};
+		fenceCI.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+		fenceCI.flags = 0;
+		VkFence fence;
+		VK_CHECK_RESULT(vkCreateFence(device, &fenceCI, nullptr, &fence));
+
+		// Submit to the queue
+		VK_CHECK_RESULT(vkQueueSubmit(queue, 1, &submitInfo, fence));
+		// Wait for the fence to signal that command buffer has finished executing
+		VK_CHECK_RESULT(vkWaitForFences(device, 1, &fence, VK_TRUE, DEFAULT_FENCE_TIMEOUT));
+
+		vkDestroyFence(device, fence, nullptr);
+		vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
 	}
 
 	void createSourceTextures()
@@ -1288,8 +1360,8 @@ public:
 		// We only use depth tests and want depth tests and writes to be enabled and compare with less or equal
 		VkPipelineDepthStencilStateCreateInfo depthStencilStateCI{};
 		depthStencilStateCI.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-		depthStencilStateCI.depthTestEnable = VK_FALSE;
-		depthStencilStateCI.depthWriteEnable = VK_FALSE;
+		depthStencilStateCI.depthTestEnable = VK_TRUE;
+		depthStencilStateCI.depthWriteEnable = VK_TRUE;
 		depthStencilStateCI.depthCompareOp = VK_COMPARE_OP_ALWAYS;
 		depthStencilStateCI.depthBoundsTestEnable = VK_FALSE;
 		depthStencilStateCI.back.failOp = VK_STENCIL_OP_KEEP;
@@ -1356,7 +1428,7 @@ public:
 		// Set pipeline stage for this shader
 		shaderStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
 		// Load binary SPIR-V shader
-		shaderStages[0].module = loadSPIRVShader(getShadersPath() + "triangle/triangleFSI.vert.spv");
+		shaderStages[0].module = loadSPIRVShader(getShadersPath() + "triangle/triangleFeedback.vert.spv");
 		// Main entry point for the shader
 		shaderStages[0].pName = "main";
 		assert(shaderStages[0].module != VK_NULL_HANDLE);
@@ -1366,7 +1438,7 @@ public:
 		// Set pipeline stage for this shader
 		shaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
 		// Load binary SPIR-V shader
-		shaderStages[1].module = loadSPIRVShader(getShadersPath() + "triangle/triangleFSIBase.frag.spv");
+		shaderStages[1].module = loadSPIRVShader(getShadersPath() + "triangle/triangleFeedbackBase.frag.spv");
 		// Main entry point for the shader
 		shaderStages[1].pName = "main";
 		assert(shaderStages[1].module != VK_NULL_HANDLE);
@@ -1395,7 +1467,7 @@ public:
 		// Set pipeline stage for this shader
 		shaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
 		// Load binary SPIR-V shader
-		shaderStages[1].module = loadSPIRVShader(getShadersPath() + "triangle/triangleFSIBlend.frag.spv");
+		shaderStages[1].module = loadSPIRVShader(getShadersPath() + "triangle/triangleFeedbackBlend.frag.spv");
 		// Main entry point for the shader
 		shaderStages[1].pName = "main";
 		assert(shaderStages[1].module != VK_NULL_HANDLE);
@@ -1458,7 +1530,9 @@ public:
 		makeBaseTexture();
 		makeBlendTexture();
 		createSourceTextures();
-		createFSIImages();
+		createFeedbackImages();
+		transitionImages();
+		createFeedbackFrameBuffer();
 		createDescriptorSetLayout();
 		createDescriptorPool();
 		createDescriptorSets();
@@ -1492,6 +1566,7 @@ public:
 		shaderData.projectionMatrix = camera.matrices.perspective;
 		shaderData.viewMatrix = camera.matrices.view;
 		shaderData.modelMatrix = glm::mat4(1.0f);
+		shaderData.rtSize = { static_cast<float>(width), static_cast<float>(height), 0.0f, 0.0f };
 
 		// Copy the current matrices to the current frame's uniform buffer
 		// Note: Since we requested a host coherent memory type for the uniform buffer, the write is instantly visible to the GPU
@@ -1523,35 +1598,45 @@ public:
 		renderPassBeginInfo.renderArea.extent.height = height;
 		renderPassBeginInfo.clearValueCount = 2;
 		renderPassBeginInfo.pClearValues = clearValues;
-		renderPassBeginInfo.framebuffer = frameBuffers[imageIndex];
+		renderPassBeginInfo.framebuffer = feedbackFrameBuffer;
 
 		const VkCommandBuffer commandBuffer = commandBuffers[currentFrame];
 		VK_CHECK_RESULT(vkBeginCommandBuffer(commandBuffer, &cmdBufInfo));
 
-		// Clear the FSI images
+		// Clear the feedback images
 		{
 			VkImageMemoryBarrier barrier;
 			barrier = vks::initializers::imageMemoryBarrier();
-			barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+			barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;;
 			barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-			barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-			barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+			barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 			barrier.subresourceRange.levelCount = 1;
 			barrier.subresourceRange.layerCount = 1;
 
 			// Color barrier
-			barrier.image = fsiImageColor.image;
-			vkCmdPipelineBarrier(commandBuffers[currentFrame], VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+			barrier.image = feedbackImageColor.image;
+			vkCmdPipelineBarrier(commandBuffer,
+				VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+			barrier = vks::initializers::imageMemoryBarrier();
+			barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+			barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+			barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+			barrier.subresourceRange.levelCount = 1;
+			barrier.subresourceRange.layerCount = 1;
 
 			// Depth barrier
-			barrier.image = fsiImageDepth.image;
-			vkCmdPipelineBarrier(commandBuffers[currentFrame], VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+			barrier.image = feedbackImageDepth.image;
+			vkCmdPipelineBarrier(commandBuffer,
+				VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-			VkClearColorValue clearValuesFSI[2] = {
-				{ 0.0f, 0.0f, 0.2f, 0.0f }, // color
-				{ 1.0f, 0.0f, 0.0f, 0.0f }, // depth
-			};
+			VkClearColorValue clearColorValue = { 0.0f, 0.0f, 0.2f, 0.0f };
 			VkImageSubresourceRange range{};
 			range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 			range.baseMipLevel = 0;
@@ -1560,27 +1645,43 @@ public:
 			range.layerCount = 1;
 
 			// Clear color
-			vkCmdClearColorImage(commandBuffers[currentFrame], fsiImageColor.image, VK_IMAGE_LAYOUT_GENERAL, &clearValuesFSI[0], 1, &range);
+			vkCmdClearColorImage(commandBuffer, feedbackImageColor.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColorValue, 1, &range);
+
+			range.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+
+			VkClearDepthStencilValue clearDepthValue = { 1.0f, 0 };
 
 			// Clear depth
-			vkCmdClearColorImage(commandBuffers[currentFrame], fsiImageDepth.image, VK_IMAGE_LAYOUT_GENERAL, &clearValuesFSI[1], 1, &range);
+			vkCmdClearDepthStencilImage(commandBuffer, feedbackImageDepth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearDepthValue, 1, &range);
 
 			barrier = vks::initializers::imageMemoryBarrier();
 			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-			barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-			barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-			barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+			barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			barrier.newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
 			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 			barrier.subresourceRange.levelCount = 1;
 			barrier.subresourceRange.layerCount = 1;
 
 			// Color barrier
-			barrier.image = fsiImageColor.image;
-			vkCmdPipelineBarrier(commandBuffers[currentFrame], VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+			barrier.image = feedbackImageColor.image;
+			vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+			barrier = vks::initializers::imageMemoryBarrier();
+			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			barrier.newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+			barrier.subresourceRange.levelCount = 1;
+			barrier.subresourceRange.layerCount = 1;
 
 			// Depth barrier
-			barrier.image = fsiImageDepth.image;
-			vkCmdPipelineBarrier(commandBuffers[currentFrame], VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+			barrier.image = feedbackImageDepth.image;
+			vkCmdPipelineBarrier(commandBuffers[currentFrame], VK_PIPELINE_STAGE_TRANSFER_BIT,
+				VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT  | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+				0, 0, nullptr, 0, nullptr, 1, &barrier);
 		}
 
 
@@ -1608,20 +1709,127 @@ public:
 		vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertices.buffer, offsets);
 		// Bind triangle index buffer
 		vkCmdBindIndexBuffer(commandBuffer, indices.buffer, 0, VK_INDEX_TYPE_UINT32);
-		// Draw the cube one at a time
-		for (uint32_t baseIndex = 0; baseIndex < indices.count; baseIndex += static_cast<uint32_t>(cubeIndices.size()))
+		// Draw the triangles one at a time since they overlap and require feedback
+		for (uint32_t baseIndex = 0; baseIndex < indices.count; baseIndex += 3)
 		{
 			// Do the base and blend passes
 			for (int i = 0; i < 2; i++)
 			{
+				// Color feedback barrier
+				VkImageMemoryBarrier barrier;
+				barrier = vks::initializers::imageMemoryBarrier();
+				barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+				barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+				barrier.oldLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+				barrier.newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+				barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+				barrier.subresourceRange.levelCount = 1;
+				barrier.subresourceRange.layerCount = 1;
+
+				barrier.image = feedbackImageColor.image;
+				vkCmdPipelineBarrier(commandBuffer,
+					VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+					VK_DEPENDENCY_BY_REGION_BIT | VK_DEPENDENCY_FEEDBACK_LOOP_BIT_EXT, 0, nullptr, 0, nullptr, 1, &barrier);
+
+				// Depth feedback barrier
+				barrier = vks::initializers::imageMemoryBarrier();
+				barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+				barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+				barrier.oldLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+				barrier.newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+				barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+				barrier.subresourceRange.levelCount = 1;
+				barrier.subresourceRange.layerCount = 1;
+
+				barrier.image = feedbackImageDepth.image;
+				vkCmdPipelineBarrier(commandBuffer,
+					VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, 
+					VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT | VK_DEPENDENCY_FEEDBACK_LOOP_BIT_EXT,
+					0, nullptr, 0, nullptr, 1, &barrier);
+
 				// Bind the rendering pipeline
 				// The pipeline (state object) contains all states of the rendering pipeline, binding it will set all the states specified at pipeline creation time
 				vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, i == 0 ? pipelineBase : pipelineBlend);
 				// Draw indexed triangle
-				vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(cubeIndices.size()), 1, baseIndex, 0, 0);
+				vkCmdDrawIndexed(commandBuffer, 3, 1, baseIndex, 0, 0);
 			}
 		}
 		vkCmdEndRenderPass(commandBuffer);
+
+		// Copy color results to the swap chain
+		{
+			VkImageMemoryBarrier barrier;
+			barrier = vks::initializers::imageMemoryBarrier();
+			barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;;
+			barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+			barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			barrier.subresourceRange.levelCount = 1;
+			barrier.subresourceRange.layerCount = 1;
+
+			// Color barrier
+			barrier.image = feedbackImageColor.image;
+			vkCmdPipelineBarrier(commandBuffer,
+				VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+			// Swap chain image barrier
+			barrier = vks::initializers::imageMemoryBarrier();
+			barrier.srcAccessMask = VK_ACCESS_NONE;;
+			barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+			barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			barrier.subresourceRange.levelCount = 1;
+			barrier.subresourceRange.layerCount = 1;
+
+			barrier.image = swapChain.images[imageIndex];
+			vkCmdPipelineBarrier(commandBuffers[currentFrame],
+				VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+			VkImageCopy region = {
+				.srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 },
+				.srcOffset = {},
+				.dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 },
+				.dstOffset = {},
+				.extent = { width, height, 1 } };
+
+			vkCmdCopyImage(commandBuffer, feedbackImageColor.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				swapChain.images[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+			barrier = vks::initializers::imageMemoryBarrier();
+			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;;
+			barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+			barrier.newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			barrier.subresourceRange.levelCount = 1;
+			barrier.subresourceRange.layerCount = 1;
+
+			// Color barrier
+			barrier.image = feedbackImageColor.image;
+			vkCmdPipelineBarrier(commandBuffer,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+			// Swap chain image barrier
+			barrier = vks::initializers::imageMemoryBarrier();
+			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			barrier.dstAccessMask = VK_ACCESS_NONE;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			barrier.subresourceRange.levelCount = 1;
+			barrier.subresourceRange.layerCount = 1;
+
+			barrier.image = swapChain.images[imageIndex];
+			vkCmdPipelineBarrier(commandBuffer,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+				0, 0, nullptr, 0, nullptr, 1, &barrier);
+		}
+
 		// Ending the render pass will add an implicit barrier transitioning the frame buffer color attachment to
 		// VK_IMAGE_LAYOUT_PRESENT_SRC_KHR for presenting it to the windowing system
 		VK_CHECK_RESULT(vkEndCommandBuffer(commandBuffer));
@@ -1629,7 +1837,7 @@ public:
 		// Submit the command buffer to the graphics queue
 
 		// Pipeline stage at which the queue submission will wait (via pWaitSemaphores)
-		VkPipelineStageFlags waitStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+		VkPipelineStageFlags waitStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 		// The submit info structure specifies a command buffer queue submission batch
 		VkSubmitInfo submitInfo{};
 		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1673,24 +1881,16 @@ public:
 
 	void getEnabledFeatures() override
 	{
-		if (deviceFeatures.fragmentStoresAndAtomics)
-		{
-			enabledFeatures.fragmentStoresAndAtomics = VK_TRUE;
-		}
-		else
-		{
-			vks::tools::exitFatal("Selected GPU does not support stores and atomic operations in the fragment stage", VK_ERROR_FEATURE_NOT_PRESENT);
-		}
 	}
 
 	void getEnabledExtensions() override
 	{
 		// Make sure fragment shader interlock is enabled
-		enabledDeviceExtensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
+		enabledDeviceExtensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 
 		// Make sure the features is visible
-		extInterlock.pNext = deviceCreatepNextChain;
-		deviceCreatepNextChain = &extInterlock;
+		extFeedbackLoopLayout.pNext = deviceCreatepNextChain;
+		deviceCreatepNextChain = &extFeedbackLoopLayout;
 	}
 
 	static constexpr int texWidth = 256;

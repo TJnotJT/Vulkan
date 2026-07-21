@@ -4,30 +4,30 @@
 #define MODE 0 // 0 for base, 1 for blend.
 #endif
 
-#extension GL_ARB_fragment_shader_interlock : require
-
-// layout (early_fragment_tests) in;
-
-layout(pixel_interlock_ordered) in;
-
 layout (location = 0) in vec4 inColor;
 layout (location = 1) in vec2 inTex;
 
 layout (location = 0) out vec4 outFragColor;
 
-layout (set = 0, binding = 1, rgba8) uniform coherent image2D fsiImageColor;
-layout (set = 0, binding = 2, r32f) uniform coherent image2D fsiImageDepth;
+layout (set = 0, binding = 1) uniform sampler2D samplerColor;
+layout (set = 0, binding = 2) uniform sampler2D samplerDepth;
 
 layout (set = 0, binding = 3) uniform sampler2D imageBase;
 layout (set = 0, binding = 4) uniform sampler2D imageBlend;
 
+layout (set = 0, binding = 0) uniform UBO 
+{
+	mat4 projectionMatrix;
+	mat4 modelMatrix;
+	mat4 viewMatrix;
+	vec4 rtSize;
+} ubo;
+
 void main()
 {
-	beginInvocationInterlockARB();
-
 	// Load curent color/depth.
-	vec4 currColor = imageLoad(fsiImageColor, ivec2(gl_FragCoord.xy));
-	float currZ = imageLoad(fsiImageDepth, ivec2(gl_FragCoord.xy)).x;
+	vec4 currColor = texture(samplerColor, gl_FragCoord.xy / ubo.rtSize.xy);
+	float currZ = texture(samplerDepth, gl_FragCoord.xy / ubo.rtSize.xy).x;
 
 	// Emulate Z test (less equal).
 	float inputZ = gl_FragCoord.z;
@@ -56,9 +56,6 @@ void main()
 	outFragColor = failZ ? currColor : outFragColor;
 	float outZ = failZ ? currZ : inputZ;
 
-	// Write back.
-	imageStore(fsiImageColor, ivec2(gl_FragCoord.xy), outFragColor);
-	imageStore(fsiImageDepth, ivec2(gl_FragCoord.xy), vec4(outZ, 0, 0, 0));
-
-	endInvocationInterlockARB();
+	// Write back depth (color is already written in outFragColor).
+	gl_FragDepth = outZ;
 }

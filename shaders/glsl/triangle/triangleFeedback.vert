@@ -9,6 +9,7 @@ layout (binding = 0) uniform UBO
 	mat4 projectionMatrix;
 	mat4 modelMatrix;
 	mat4 viewMatrix;
+	vec4 rtSize;
 } ubo;
 
 layout (location = 0) out vec4 outColor;
